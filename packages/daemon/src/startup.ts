@@ -36,6 +36,7 @@ import { ClaudeResumeAdapter } from "./adapters/claude-resume.js";
 import { CodexResumeAdapter } from "./adapters/codex-resume.js";
 import { codexDaemonSupportProbe } from "./domain/codex-daemon-support.js";
 import { PiResumeAdapter } from "./adapters/pi-resume.js";
+import { AgyResumeAdapter } from "./adapters/agy-resume.js";
 import { RigSpecExporter } from "./domain/rigspec-exporter.js";
 import { PodRepository } from "./domain/pod-repository.js";
 import { RigSpecPreflight } from "./domain/rigspec-preflight.js";
@@ -533,6 +534,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }) },
     { stateRoot: piStateRoot, runnerEntryPath: piRunnerEntryPath },
   );
+  const agyResume = new AgyResumeAdapter(tmuxAdapter, { launchPath: process.env.PATH });
   // Services infrastructure (RigEnv) — created early so restore/bootstrap can use it
   const { ComposeServicesAdapter } = await import("./adapters/compose-services-adapter.js");
   const { ServiceOrchestrator } = await import("./domain/service-orchestrator.js");
@@ -541,7 +543,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
   const restoreOrchestrator = new RestoreOrchestrator({
     db, rigRepo, sessionRegistry, eventBus, snapshotRepo, snapshotCapture,
-    checkpointStore, nodeLauncher, tmuxAdapter, claudeResume, codexResume, piResume,
+    checkpointStore, nodeLauncher, tmuxAdapter, claudeResume, codexResume, piResume, agyResume,
     transcriptStore, serviceOrchestrator,
   });
 
@@ -679,6 +681,32 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const { StubRuntimeAdapter } = await import("./adapters/stub-runtime-adapter.js");
   const stubRunnerEntryPath = nodePath.resolve(import.meta.dirname, "./adapters/stub-runner.js");
   const stubAdapter = new StubRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, runnerEntryPath: stubRunnerEntryPath });
+  const { AgyRuntimeAdapter } = await import("./adapters/agy-runtime-adapter.js");
+  const agyAdapter = new AgyRuntimeAdapter({
+    tmux: tmuxAdapter,
+    fsOps: {
+      readFile: (p: string) => fs.readFileSync(p, "utf-8"),
+      writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"),
+      exists: (p: string) => fs.existsSync(p),
+      mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }),
+      listFiles: (dir: string) => {
+        const r: string[] = [];
+        function w(d: string, pre: string) {
+          for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+            if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name));
+            else r.push(pre ? nodePath.join(pre, e.name) : e.name);
+          }
+        }
+        w(dir, "");
+        return r;
+      },
+      statMode: (p: string) => fs.statSync(p).mode,
+      chmod: (p: string, m: number) => fs.chmodSync(p, m),
+      homedir: daemonHome,
+    },
+    homedir: daemonHome,
+    launchPath: process.env.PATH,
+  });
 
   // plugin-primitive Phase 3a slice 3.5 — ensure Codex feature flag
   // codex_hooks = true is set in ~/.codex/config.toml so plugin-shipped
@@ -858,7 +886,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     db, rigRepo, podRepo,
     sessionRegistry, eventBus, nodeLauncher, startupOrchestrator,
     fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), exists: (p: string) => fs.existsSync(p) },
-    adapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
+    adapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "stub": stubAdapter, "agy": agyAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
     tmuxAdapter,
     agentImageLibrary,
     continuityPolicyMaterializer,
@@ -1110,7 +1138,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     }),
     podInstantiator,
     podBundleSourceResolver,
-    runtimeAdapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
+    runtimeAdapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "stub": stubAdapter, "agy": agyAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
     transcriptStore,
     sessionTransport: (() => {
       const t = new SessionTransport({
@@ -2264,6 +2292,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     "claude-code": claudeAdapter,
     codex: codexAdapter,
     pi: piAdapter,
+    agy: agyAdapter,
   }, usageSamplesStore, () => providerWindowSamplesFromSignals(
     collectClaudeSignalsFromProviderUsageDirectory(
       providerUsageDirectory(OPENRIG_HOME),

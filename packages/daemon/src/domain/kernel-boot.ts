@@ -29,6 +29,7 @@ export type RuntimeAuthStatus = "ok" | "unavailable";
 export interface RuntimeProbeResult {
   claudeCode: RuntimeAuthStatus;
   codex: RuntimeAuthStatus;
+  agy?: RuntimeAuthStatus;
 }
 
 export interface KernelBootDeps {
@@ -101,7 +102,7 @@ export async function bootKernelIfNeeded(deps: KernelBootDeps): Promise<KernelBo
   // 3. Probe runtime auth state to pick a variant.
   const probe = await (deps.probeRuntimes ?? defaultProbeRuntimes)();
 
-  if (probe.claudeCode === "unavailable" && probe.codex === "unavailable") {
+  if (probe.claudeCode === "unavailable" && probe.codex === "unavailable" && probe.agy !== "ok") {
     const msg = authBlockMessage();
     log("error", msg);
     tracker.setAuthBlocked(msg);
@@ -141,6 +142,7 @@ export function selectVariant(probe: RuntimeProbeResult): string {
   if (probe.claudeCode === "ok" && probe.codex === "ok") return "rig.yaml";
   if (probe.claudeCode === "ok") return "rig-claude-only.yaml";
   if (probe.codex === "ok") return "rig-codex-only.yaml";
+  if (probe.agy === "ok") return "rig-agy-only.yaml";
   // Caller is expected to short-circuit before reaching here on the
   // both-unavailable path; defensive default keeps the type narrow.
   return "rig.yaml";
@@ -168,12 +170,13 @@ export async function defaultProbeRuntimes(): Promise<RuntimeProbeResult> {
     }
   }
 
-  const [claudeCode, codex] = await Promise.all([
+  const [claudeCode, codex, agy] = await Promise.all([
     tryProbe("claude auth status"),
     tryProbe("codex login status"),
+    tryProbe("agy --version"),
   ]);
 
-  return { claudeCode, codex };
+  return { claudeCode, codex, agy };
 }
 
 /** Honest 3-part-error message for the auth-block path. Per IMPL-PRD
@@ -181,8 +184,8 @@ export async function defaultProbeRuntimes(): Promise<RuntimeProbeResult> {
 export function authBlockMessage(): string {
   return [
     "Error: Kernel rig cannot boot — no AI runtime is authenticated.",
-    "Reason: Kernel rig requires at least one of Claude Code or Codex authenticated. Both are unavailable.",
-    "Fix: Run `claude auth login` to authenticate Claude Code, OR `codex login` to authenticate Codex. Then run `rig daemon start` (or `rig setup`) again.",
+    "Reason: Kernel rig requires at least one of Claude Code, Codex, or Antigravity authenticated. All are unavailable.",
+    "Fix: Run `claude auth login` to authenticate Claude Code, `codex login` to authenticate Codex, or install `agy`. Then run `rig daemon start` (or `rig setup`) again.",
   ].join("\n");
 }
 
