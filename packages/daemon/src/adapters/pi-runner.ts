@@ -287,7 +287,43 @@ export interface RunnerIo {
   sessionFileExists?(path: string): boolean;
   /** Terminate OMP when get_state cannot establish a resumable seat. */
   stopChild?(): void;
+  /** Id of the last entry in a session file, read from the file's tail. A cursor
+   *  derived here costs one small read; asking OMP for it means get_entries
+   *  without `since`, which returns the whole session. */
+  lastEntryIdOf?(sessionFile: string): string | undefined;
   now(): string;
+}
+
+/** Last entry id of an OMP session JSONL file, reading backwards from the end
+ *  until the final complete line is in hand. Undefined for a missing, empty or
+ *  unreadable file, a last line that is not JSON, or one larger than `maxBytes`. */
+export function readLastEntryId(sessionFile: string, maxBytes = 32 * 1024 * 1024): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(sessionFile, "r");
+    const size = fs.fstatSync(fd).size;
+    const chunk = 64 * 1024;
+    let end = size;
+    let tail = Buffer.alloc(0);
+    while (end > 0 && size - end < maxBytes) {
+      const start = Math.max(0, end - chunk);
+      const buf = Buffer.alloc(end - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      tail = Buffer.concat([buf, tail]);
+      end = start;
+      const trimmed = tail.toString("utf8").replace(/\s+$/, "");
+      if (trimmed.includes("\n") || end === 0) {
+        const last = trimmed.slice(trimmed.lastIndexOf("\n") + 1);
+        const id = (JSON.parse(last) as { id?: unknown }).id;
+        return typeof id === "string" ? id : undefined;
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 const GET_STATE_ID = "pi-runner-get-state";
@@ -414,6 +450,14 @@ export class RunnerCore {
         if (this.runtime === "omp") this.io.stopChild?.();
         return;
       }
+      if ((record.id === CURSOR_REFRESH_ID || record.id === CATCH_UP_ID) && message.startsWith("Unknown entries cursor")) {
+        // OMP no longer knows the saved cursor. Drop it: the next refresh derives a fresh one
+        // from the session file instead of repeating a request that can only fail.
+        this.lastEntryId = undefined;
+        this.writeSidecar({});
+        this.io.mirrorLine(`[${this.runtime}-runner] entry cursor unknown to ${this.runtime}; it is re-derived at the next turn end`);
+        return;
+      }
       this.io.mirrorLine(`[${this.runtime}-runner] ERROR rpc: ${message}`);
       // Only a rejected input means the seat cannot do the requested work.
       // A mistimed /abort (or any control command) leaves the seat idle.
@@ -515,6 +559,7 @@ export class RunnerCore {
       // entries after the cursor: an unbounded get_entries returns the whole
       // session, and on a long session that response exceeds OMP's RPC frame
       // limit ("RPC response exceeded the transport limit").
+      if (!this.lastEntryId && this.sessionFile) this.lastEntryId = this.io.lastEntryIdOf?.(this.sessionFile);
       this.io.sendRpc(this.lastEntryId
         ? { type: "get_entries", since: this.lastEntryId, id: CURSOR_REFRESH_ID }
         : { type: "get_entries", id: CURSOR_REFRESH_ID });
@@ -912,6 +957,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     now: () => new Date().toISOString(),
     stopChild: () => { child.kill(); },
     sessionFileExists: (path) => fs.existsSync(path),
+    lastEntryIdOf: readLastEntryId,
   };
 
   const core = new RunnerCore(io, {

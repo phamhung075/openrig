@@ -5,10 +5,13 @@
 // durable catch-up cursor, and honest pi-exit reporting. No live pi.
 
 import { describe, it, expect, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import nodePath from "node:path";
 import { PassThrough } from "node:stream";
 import {
   createRunnerInput, MAX_PI_INPUT_BYTES, RunnerCore, mapPiEvent, parseRunnerArgs,
-  prepareRunnerSidecar,
+  prepareRunnerSidecar, readLastEntryId,
   type RunnerIo,
 } from "../src/adapters/pi-runner.js";
 import { PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, type PiRunnerState } from "../src/adapters/pi-runner-protocol.js";
@@ -610,5 +613,55 @@ describe("cursor refresh via get_entries (QA RED, qitem-20260707020922)", () => 
       data: { sessionFile: SESSION_FILE, sessionId: "x" },
     }));
     expect(f.sidecars.at(-1)!.lastEntryId).toBe("e5");
+  });
+});
+
+describe("entry cursor without a saved cursor (OMP frame limit)", () => {
+  it("readLastEntryId reads the id of the last line, even when that line is larger than one read block", () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "pi-runner-cursor-"));
+    const file = nodePath.join(dir, "s.jsonl");
+    fs.writeFileSync(file, [
+      JSON.stringify({ id: "e1", type: "message" }),
+      JSON.stringify({ id: "e2", type: "message", message: "x".repeat(200_000) }),
+      "",
+    ].join("\n"));
+    expect(readLastEntryId(file)).toBe("e2");
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  it("readLastEntryId answers undefined for a missing file, an empty file and a last line without an id", () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "pi-runner-cursor-"));
+    const empty = nodePath.join(dir, "empty.jsonl");
+    const noId = nodePath.join(dir, "noid.jsonl");
+    fs.writeFileSync(empty, "");
+    fs.writeFileSync(noId, JSON.stringify({ type: "header" }) + "\n");
+    expect(readLastEntryId(nodePath.join(dir, "missing.jsonl"))).toBeUndefined();
+    expect(readLastEntryId(empty)).toBeUndefined();
+    expect(readLastEntryId(noId)).toBeUndefined();
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  it("with no cursor, agent_end derives it from the session file and asks only for entries after it", () => {
+    const f = fakeIo();
+    f.io.lastEntryIdOf = (file) => (file === SESSION_FILE ? "tail-7" : undefined);
+    const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-9" });
+    core.start();
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-get-state", data: { sessionFile: SESSION_FILE, sessionId: "x" } }));
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(f.rpc).toContainEqual({ type: "get_entries", since: "tail-7", id: "pi-runner-cursor-refresh" });
+    expect(f.rpc).not.toContainEqual({ type: "get_entries", id: "pi-runner-cursor-refresh" });
+  });
+
+  it("an unknown-cursor error drops the saved cursor, persists that, and is not reported as a runtime error", () => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-9" }, { catchUpSince: "gone" });
+    core.start();
+    core.handlePiLine(JSON.stringify({
+      type: "response", id: "pi-runner-catch-up", success: false, command: "get_entries",
+      error: "Unknown entries cursor: gone",
+    }));
+    expect(f.sidecars.at(-1)!.lastEntryId).toBeUndefined();
+    expect(f.lines.some((l) => l.includes("entry cursor unknown"))).toBe(true);
+    expect(f.lines.some((l) => l.includes("ERROR rpc"))).toBe(false);
   });
 });
