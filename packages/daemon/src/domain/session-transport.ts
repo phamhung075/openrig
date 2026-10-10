@@ -1153,6 +1153,12 @@ export class SessionTransport {
   }
 
   async send(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+    return this.sendInternal(sessionName, text, opts);
+  }
+
+  // The delivery path. The Enter-consumed check re-enters here, not through send(), so it is one
+  // delivery as far as callers observing send() are concerned.
+  private async sendInternal(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
     const guard = this.tmuxAdapter.deliveryGuard;
     if (!guard) return this.sendUnguarded(sessionName, text, opts);
     const outbox = new OutboxHandler(this.db);
@@ -1600,7 +1606,7 @@ export class SessionTransport {
       for (const delayMs of checkDelaysMs) {
         await this.sleep(delayMs);
         try {
-          const confirm = await this.send(sessionName, "", {
+          const confirm = await this.sendInternal(sessionName, "", {
             submitOnly: true,
             expectedStagedText: text,
             expectedStagedLineCount: text.split("\n").length,

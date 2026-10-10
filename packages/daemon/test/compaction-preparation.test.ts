@@ -86,7 +86,7 @@ it('skip-map still respects a positive permission prompt',async()=>{
  const f=fixture();f.activity('needs_input');const r=await f.e.triggerManualCompact(input,{operatorInitiated:true,skipMap:true});expect(r.triggered).toBe(false);expect(compacts(f)).toHaveLength(0);
 });
 it('manual map wait holds no input lease: ordinary delivery completes before map publication',async()=>{
- const f=fixture();f.onSleep(async()=>{
+ const f=fixture(2000);f.onSleep(async()=>{
   expect(f.guard.ownsLifecycle('node-one')).toBe(false);
   expect((await f.transport.send(seat,'ordinary during preparation')).ok).toBe(true);
   stageMap(f);
@@ -309,7 +309,7 @@ it('preparation receipt: positive permission prompt before prep is an unsent ref
  expect(f.writes).toHaveLength(0);
 });
 it('registered cwd: manual route selects a self-ignoring map inside the launch workspace',async()=>{
- const f=fixture();const cwd=join(f.home,'code repo');mkdirSync(cwd);
+ const f=fixture(2000);const cwd=join(f.home,'code repo');mkdirSync(cwd);
  execFileSync('git',['-c','init.templateDir=','init','--quiet',cwd]);
  f.onSleep(async()=>{stageMap(f);});
  expect((await routeFixture(f,cwd)()).status).toBe(200);
@@ -408,7 +408,7 @@ it.skipIf(process.getuid?.()===0)('workspace setup: an unwritable descendant sel
 });
 
 for(const mode of ['automatic','manual'])it(`${mode}: daemon publishes the complete temp bytes before compact input`,async()=>{
- const f=fixture();let completed='';let inode=0;
+ const f=fixture(2000);let completed='';let inode=0;
  const finish=()=>{stageMap(f);const a=f.e.getPreparationState(seat)!;completed=readFileSync(a.mapPath+'.tmp','utf8');inode=statSync(a.mapPath+'.tmp').ino;expect(existsSync(a.mapPath)).toBe(false);};
  const send=f.tmux.sendText.getMockImplementation()!;
  f.tmux.sendText.mockImplementation(async(...args)=>{

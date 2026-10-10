@@ -481,7 +481,7 @@ describe("SessionTransport", () => {
       const result = await transport.send("dev-impl@my-rig", MSG);
 
       expect(result.ok).toBe(true);
-      expect(keys).toEqual(["C-m", "C-m"]);
+      expect(keys).toEqual(["Enter", "Enter"]);
       expect(sleeps).toContain(1500);
     });
 

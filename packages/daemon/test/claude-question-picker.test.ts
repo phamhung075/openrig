@@ -162,7 +162,9 @@ describe("ordinary transport under current and historical questions", () => {
         expect(paste).toHaveBeenCalledTimes(sent ? 1 : 0);
         expect(enter).toHaveBeenCalledTimes(sent ? 1 : 0);
         if (!sent) expect(result.reason).toBe("target_needs_input");
-        expect(capture).toHaveBeenCalledTimes(hook.name.startsWith("fresh_") ? 0 : 1);
+        // The gate reads the pane once unless the hook is fresh; a sent Claude message adds one
+        // guarded read after the Enter to confirm it was consumed.
+        expect(capture).toHaveBeenCalledTimes((hook.name.startsWith("fresh_") ? 0 : 1) + (sent ? 1 : 0));
       } finally { db.close(); }
     });
   }

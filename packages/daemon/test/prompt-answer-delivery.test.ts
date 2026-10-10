@@ -225,7 +225,9 @@ describe("explicit prompt answer delivery", () => {
       const f = fixture("ordinary"); f.state.capture = "❯ green please\n────────────────────";
       const r = await viaCli(f, "green please", fanout, { override: false });
       expect(r.calls.filter(c => c.body.submitOnly)).toHaveLength(1);
-      expect(f.state.submitted).toEqual(["green please", ""]);
+      // The CLI repair is the one submit-only call above. The transport's own Enter check adds a
+      // second guarded Enter here because this fixture holds the staged render after every Enter.
+      expect(f.state.submitted).toEqual(["green please", "", ""]);
       // This fixture deliberately holds the staged render after both Enters.
       expect(r.exit).toBe(1);
       expect(r.logs.join("\n")).toContain("staged-not-consumed");
