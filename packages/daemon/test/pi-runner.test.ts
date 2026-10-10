@@ -573,6 +573,13 @@ describe("cursor refresh via get_entries (QA RED, qitem-20260707020922)", () => 
     expect(rpc).toContainEqual({ type: "get_entries", id: "pi-runner-cursor-refresh" });
   });
 
+  it("with a cursor, the refresh asks only for entries after it (a whole-session reply exceeds OMP's frame limit)", () => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-9" }, { catchUpSince: "e5" });
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(f.rpc).toContainEqual({ type: "get_entries", since: "e5", id: "pi-runner-cursor-refresh" });
+  });
+
   it("the refresh response advances lastEntryId from the LAST entry and persists it", () => {
     const { core, sidecars } = readyCore();
     core.handlePiLine(JSON.stringify({

@@ -511,8 +511,13 @@ export class RunnerCore {
       // session-entry ids, so the durable cursor starved (lastEntryId stayed
       // null in real runs). Refresh it from the source of truth after every
       // completed turn — get_entries returns append-order entries with stable
-      // ids; the response handler advances the cursor from the tail.
-      this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
+      // ids; the response handler advances the cursor from the tail. Ask only for
+      // entries after the cursor: an unbounded get_entries returns the whole
+      // session, and on a long session that response exceeds OMP's RPC frame
+      // limit ("RPC response exceeded the transport limit").
+      this.io.sendRpc(this.lastEntryId
+        ? { type: "get_entries", since: this.lastEntryId, id: CURSOR_REFRESH_ID }
+        : { type: "get_entries", id: CURSOR_REFRESH_ID });
     }
     if (mapped.mirrorAppend) this.io.mirrorAppend(mapped.mirrorAppend);
     for (const line of mapped.mirrorLines) this.io.mirrorLine(line);
