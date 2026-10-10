@@ -1552,7 +1552,7 @@ export class RestoreOrchestrator {
     }
 
     if (this.agyResume?.canResume(resumeType, resumeToken)) {
-      const result = await this.agyResume.resume(sessionName, resumeType, resumeToken, cwd, model, resolvedPosture);
+      const result = await this.agyResume.resume(sessionName, resumeType, resumeToken, cwd, model, resolvedPosture === "auto" ? "floor" : resolvedPosture);
       if (result.ok) {
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };
