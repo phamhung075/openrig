@@ -29,7 +29,7 @@
 //   CROSSING_QITEM      the qitem id of the cloud row this crossing drives; the local row is
 //                       created WITH it, so `agenthub:decision:<qitem>` names that same row
 //   CROSSING_SEAT       the asker's session name, rig-suffixed (<seat>@<rig>)
-//   CROSSING_HUMAN      the human's address the answer is recorded against
+//   CROSSING_HUMAN      the human destination ref, verbatim from CROSSING-ENV section 5 (no mapping)
 //   CROSSING_RESET_CMD  the clean-scratch-DB step, run once before the behaviours
 //   CROSSING_ANSWER_CMD the command that POSTs an answer AS the human (re-runnable)
 //   CROSSING_ASKROW_CMD the read-back that prints the cloud's decision row(s) for CROSSING_RIG
@@ -93,10 +93,11 @@ if (process.env.CROSSING_BASE_URL) allowFetchTarget(process.env.CROSSING_BASE_UR
 
 const rig = process.env.CROSSING_RIG ?? "";
 const seat = process.env.CROSSING_SEAT ?? "";
-/** The human's address. It MUST parse as an EXTERNAL session (`<local>@external`): the daemon's
- *  direct-reply resolve refuses any other shape outright (`resolveDirectHumanReply` requires
- *  `parseSessionName(destination).kind === "external"`), which is why the unit twin's fixture uses
- *  `human-founder@external`. The cloud row's own `destination` column is free text and unrelated. */
+/** The human destination, exactly as the fixture's section 5 seed table states it. Nothing maps it
+ *  here: it is the session ref the daemon posts verbatim (`ask-driver.ts`) and requires verbatim to
+ *  resolve a direct reply (`resolveDirectHumanReply`: the destination must equal the actor and parse
+ *  as an `external`-kind session), and the reset restores this same value onto the cloud row, so
+ *  both sides read one address. */
 const human = process.env.CROSSING_HUMAN ?? "";
 
 /** The frozen §4 binding: a human whose connector kind is the new set member. `entityId` is the
