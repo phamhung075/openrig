@@ -12,7 +12,10 @@
 // the cursor where it was, because the retry IS the fix; and a PERMANENT contract-class refusal (any
 // other 4xx — a malformed body, an outcome or dropped reason outside the closed list, a bad bearer,
 // an unmounted route) is settled for that drain only: logged once, left UN-ACKED, and skipped, since
-// no cadence changes a refused request. Without that last class one refused row would freeze every
+// no cadence changes a refused request. It is stated as the COMPLEMENT of the transport test rather
+// than as a status range, so nothing falls through it: a 3xx (a redirect to a login page — a config
+// fault, not a retryable one) is refused-and-skipped too, not made to stop the rig. Without that
+// last class one refused row would freeze every
 // later answer for its rig — the same stall the no-stall clause forbids for an unreadable row — and
 // nothing is lost by skipping it, because the answer was applied BEFORE the ack (§3) and a re-apply
 // is idempotent. What still holds the cursor: an apply that needs a retry, a refused page, or a
