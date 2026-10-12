@@ -11,6 +11,7 @@
 //
 // The parse layer is separate from the transport so a page shape can be pinned without a socket.
 
+import { createHash } from "node:crypto";
 import type { AckBody, AnswersPage, AskBody, StatePushBody, PulledAnswer } from "./contract.js";
 import { ACK_OUTCOMES, DECISIONS_ANSWERS_PATH, DECISIONS_ASK_PATH, decisionsAckPath, decisionsStatePath } from "./contract.js";
 import type { FetchImpl } from "../slack/slack-api.js";
@@ -52,6 +53,12 @@ export interface UnreadableAnswerRow {
   index: number;
   /** The row's own id when it carries one, so the log can name the decision; null when it does not. */
   decisionId: string | null;
+  /** The row's STABLE identity, which is what the driver's log-once key uses: the decision id, else
+   *  the qitem id, else a digest of the row's own bytes. Never the page index — a position is not an
+   *  identity. A re-served page can move a nameless row, and keying by index would then report the
+   *  same anomaly twice; a DIFFERENT nameless row can land on a position already reported, and
+   *  keying by index would swallow it. */
+  identity: string;
   reason: string;
 }
 
@@ -76,15 +83,25 @@ export function parseAnswersPage(body: unknown): AnswersPageParse {
   if (!Array.isArray(rows)) return { ok: false, error: 'answers body has no "answers" array' };
   const out: PulledAnswer[] = [];
   const unreadable: UnreadableAnswerRow[] = [];
-  const idOf = (row: Record<string, unknown>): string | null =>
-    typeof row.decision_id === "string" && row.decision_id.length > 0 ? row.decision_id : null;
-  const skip = (index: number, row: Record<string, unknown> | null, reason: string): void => {
-    unreadable.push({ index, decisionId: row === null ? null : idOf(row), reason });
+  const strField = (row: Record<string, unknown> | null, key: string): string | null => {
+    const v = row === null ? undefined : row[key];
+    return typeof v === "string" && v.length > 0 ? v : null;
+  };
+  const idOf = (row: Record<string, unknown> | null): string | null => strField(row, "decision_id");
+  /** See `UnreadableAnswerRow.identity`. `raw` is what came off the wire, so even a row that is not
+   *  an object has an identity of its own bytes rather than of its position. */
+  const identityOf = (row: Record<string, unknown> | null, raw: unknown): string =>
+    idOf(row) ??
+    strField(row, "qitem_id") ??
+    `digest:${createHash("sha256").update(JSON.stringify(raw) ?? "undefined").digest("hex").slice(0, 16)}`;
+  const skip = (index: number, raw: unknown, reason: string): void => {
+    const row = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : null;
+    unreadable.push({ index, decisionId: idOf(row), identity: identityOf(row, raw), reason });
   };
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     if (typeof r !== "object" || r === null) {
-      skip(i, null, "row is not an object");
+      skip(i, r, "row is not an object");
       continue;
     }
     const row = r as Record<string, unknown>;

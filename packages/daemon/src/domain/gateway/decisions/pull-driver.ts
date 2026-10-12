@@ -7,11 +7,17 @@
 //   - a transport failure doubles the interval up to 300 000 ms and the first success resets it;
 //   - ticks never overlap.
 //
-// The ACK, not the cursor, is the delivery record (§2). So the cursor advances ONLY past rows that
-// were settled AND acked: an apply that needs a retry, a refused page, or an ack that failed
-// leaves the cursor where it was, and the row — which the cloud still counts as un-acked — comes
-// back on the next tick. Nothing is remembered between ticks about what was pulled: a restart
-// re-pulls from the first page, and every step of the apply is idempotent.
+// The ACK, not the cursor, is the delivery record (§2), and the ack has four ruled classes: a 2xx
+// is delivered; a 409 is already delivered; a transport-class failure (no answer, or a 5xx) leaves
+// the cursor where it was, because the retry IS the fix; and a PERMANENT contract-class refusal (any
+// other 4xx — a malformed body, an outcome or dropped reason outside the closed list, a bad bearer,
+// an unmounted route) is settled for that drain only: logged once, left UN-ACKED, and skipped, since
+// no cadence changes a refused request. Without that last class one refused row would freeze every
+// later answer for its rig — the same stall the no-stall clause forbids for an unreadable row — and
+// nothing is lost by skipping it, because the answer was applied BEFORE the ack (§3) and a re-apply
+// is idempotent. What still holds the cursor: an apply that needs a retry, a refused page, or a
+// transport-class ack failure. Nothing is remembered between ticks about what was pulled: a restart
+// re-pulls from the first page.
 //
 // Two levels of page defect, and only one of them has a cursor (§2's no-stall clause). A ROW the
 // reader cannot use (an empty or unparseable answer set, a missing field) is logged once, skipped
@@ -64,16 +70,31 @@ function isTransportFailure(res: CloudCall): boolean {
  *  must stop with this rig's cursor unmoved (a row is owed a retry). */
 type DrainOutcome = { continueTicking: boolean; transportFailed: boolean };
 
+/** What became of ONE ack attempt (§1 route 3, §2's four classes). Only `failed` may stop the drain:
+ *  a transport failure is what a retry can fix, while a refused request is what no retry can, so the
+ *  refusal is settled for this drain and the row stays UN-ACKED in the cloud. `refused` carries the
+ *  status for the log-once key (`rig|decisionId|status`). */
+type AckResult =
+  | { kind: "acked" }
+  | { kind: "already-settled" }
+  | { kind: "refused"; status: number | undefined }
+  | { kind: "failed" };
+
 export class DecisionsPullDriver {
   private readonly intervalMs: number;
   private readonly maxIntervalMs: number;
   private readonly setTimeoutFn: (fn: () => void, ms: number) => unknown;
   private readonly clearTimeoutFn: (handle: unknown) => void;
   private readonly cursors = new Map<string, string>();
-  /** Unreadable rows already reported, keyed by rig + id/position + reason: §2 requires the log
-   *  ONCE, and the cloud re-serves an un-acked row on every tick, so a repeating message would be
-   *  a per-cadence drumbeat for one anomaly. */
-  private readonly unreadableLogged = new Set<string>();
+  /** Anomalies already reported, keyed rig|identity|reason (§2 wants the log ONCE, and the cloud
+   *  re-serves an un-acked row on every drain, so a repeating message would be a per-cadence
+   *  drumbeat for one anomaly). `liveThisDrain` is the other half of the bound: a drain that reaches
+   *  the end of the cloud's page has seen that rig's whole un-acked set, so a key of that rig which
+   *  the drain did NOT meet is gone from the cloud and is dropped — a return is a new episode and
+   *  earns its own single line. The set therefore tracks the anomalies that are LIVE, never the
+   *  history of every row ever served. */
+  private readonly loggedOnce = new Set<string>();
+  private liveThisDrain = new Set<string>();
   private interval: number;
   private timer: unknown;
   private ticking = false;
@@ -153,8 +174,25 @@ export class DecisionsPullDriver {
     }
   }
 
+  /** Report one anomaly at most once per episode, and mark it live for this drain. */
+  private reportOnce(key: string, message: () => string, log: (m: string) => void): void {
+    this.liveThisDrain.add(key);
+    if (this.loggedOnce.has(key)) return;
+    this.loggedOnce.add(key);
+    log(message());
+  }
+
+  /** Drop this rig's keys that the drain did not meet: the cloud served its whole un-acked set for
+   *  that rig, so a key it did not serve is no longer live (see `loggedOnce`). */
+  private forgetUnseen(rigPrefix: string): void {
+    for (const key of this.loggedOnce) {
+      if (key.startsWith(rigPrefix) && !this.liveThisDrain.has(key)) this.loggedOnce.delete(key);
+    }
+  }
+
   private async drainRig(rig: string, log: (m: string) => void): Promise<DrainOutcome> {
     let transportFailed = false;
+    this.liveThisDrain = new Set();
     for (;;) {
       const after = this.cursors.get(rig) ?? null;
       const res = await this.deps.client.pullAnswers(rig, after);
@@ -180,11 +218,11 @@ export class DecisionsPullDriver {
       // Row-level defects are skipped FORWARD, never acked: the row keeps its place in the cloud's
       // un-acked set, so it comes back, but it can no longer hold every later answer behind it.
       for (const row of parsed.unreadable) {
-        const key = `${rig}|${row.decisionId ?? `index:${row.index}`}|${row.reason}`;
-        if (this.unreadableLogged.has(key)) continue;
-        this.unreadableLogged.add(key);
-        log(
-          `decisions pull rig=${rig} answers[${row.index}]${row.decisionId === null ? "" : ` decision=${row.decisionId}`} unreadable (${row.reason}) — skipped and NOT acked; the cloud still owns that row`,
+        this.reportOnce(
+          `${rig}|${row.identity}|${row.reason}`,
+          () =>
+            `decisions pull rig=${rig} answers[${row.index}]${row.decisionId === null ? ` identity=${row.identity}` : ` decision=${row.decisionId}`} unreadable (${row.reason}) — skipped and NOT acked; the cloud still owns that row`,
+          log,
         );
       }
       for (const item of parsed.page.answers) {
@@ -193,43 +231,65 @@ export class DecisionsPullDriver {
           log(`decisions pull rig=${rig} qitem=${item.qitem_id} not settled (${outcome.reason}) — cursor left unmoved, the row re-pulls`);
           return { continueTicking: false, transportFailed: false };
         }
-        const acked = await this.ack(item, outcome.outcome, outcome.reason, log);
-        if (!acked.ok) return { continueTicking: false, transportFailed: acked.transportFailed };
+        const acked = await this.ack(rig, item, outcome.outcome, outcome.reason, log);
+        // §2: only a TRANSPORT-class ack failure holds the cursor. A refused ack is settled for
+        // this drain, so the loop continues and the page end is still reached.
+        if (acked.kind === "failed") return { continueTicking: false, transportFailed: true };
         if (outcome.outcome === "applied") this.applied += 1;
         else this.dropped += 1;
       }
       const next = parsed.page.cursor;
       if (next.length === 0) {
         // Drained. The next tick starts from the first page: the cloud hands out only un-acked
-        // rows, so this costs one request and remembers nothing (§2).
+        // rows, so this costs one request and remembers nothing (§2) — and that is what brings a
+        // row whose ack was refused back, one drain later, with no restart.
         this.cursors.delete(rig);
+        this.forgetUnseen(`${rig}|`);
         return { continueTicking: true, transportFailed };
       }
       this.cursors.set(rig, next);
     }
   }
 
+  /** §1 route 3's four ruled classes (§2). `acked` and `already-settled` are deliveries; `failed` is
+   *  transport-class and holds the cursor because a retry IS the fix; `refused` is a permanent
+   *  contract-class 4xx — logged once, left UN-ACKED, and skipped. */
   private async ack(
+    rig: string,
     item: PulledAnswer,
     outcome: "applied" | "dropped",
     reason: DropReason | undefined,
     log: (m: string) => void,
-  ): Promise<{ ok: boolean; transportFailed: boolean }> {
+  ): Promise<AckResult> {
     const res = await this.deps.client.ack(item.decision_id, {
       machine_id: this.deps.hostId(),
       outcome,
       ...(reason === undefined ? {} : { reason }),
     });
-    if (res.ok) return { ok: true, transportFailed: false };
+    if (res.ok) return { kind: "acked" };
     if (ackAlreadySettled(res)) {
       // 409: the id is unknown or already acked. §1 route 3 — the state, not the id, is what a
       // caller can get wrong, and a retried ack must not read as a mistyped id. Settled.
       log(`decisions ack ${item.decision_id} already settled (409) — treated as delivered`);
-      return { ok: true, transportFailed: false };
+      return { kind: "already-settled" };
     }
-    this.lastError = res.error;
-    const transportFailed = isTransportFailure(res);
-    log(`decisions ack ${item.decision_id} failed (${res.error}) — cursor left unmoved, the answer re-pulls`);
-    return { ok: false, transportFailed };
+    if (isTransportFailure(res)) {
+      this.lastError = res.error;
+      log(`decisions ack ${item.decision_id} failed (${res.error}) — cursor left unmoved, the answer re-pulls`);
+      return { kind: "failed" };
+    }
+    // §2 class 4. No cadence fixes a refused request (a malformed body, an outcome or dropped reason
+    // outside the closed list, a bad bearer, an unmounted route), so this attempt is settled for
+    // THIS drain and the row stays un-acked in the cloud — which is exactly what lets a repaired
+    // bearer or a mounted route heal it with no restart. Reported once, and NOT as the driver's
+    // error state: the drain itself did its job, and marking a delivery the cloud never got would
+    // stop it from handing the row out again at all.
+    this.reportOnce(
+      `${rig}|${item.decision_id}|${res.status}`,
+      () =>
+        `decisions ack ${item.decision_id} refused (${res.error}) — not retried, NOT acked; the row stays un-acked in the cloud and the drain continues`,
+      log,
+    );
+    return { kind: "refused", status: res.status };
   }
 }

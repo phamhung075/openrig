@@ -267,15 +267,62 @@ describe("DecisionsPullDriver — drain, ack and cursor", () => {
       },
       ack: () => (ackCalls++ === 0 ? { ok: true, status: 200, body: { success: true } } : { ok: false, status: 500, error: "HTTP 500: boom" }),
     });
-    const driver = makeDriver(fake.client, alwaysApplied);
+    const driver = makeDriver(fake.client, alwaysApplied, { intervalMs: 1000, maxIntervalMs: 2000 });
 
     await driver.tick(); // page1 acked (cursor -> cur-1), page2 ack fails: cur-2 must not be committed
     expect(fake.acks.map((a) => a.decisionId)).toEqual(["d-1", "d-2"]);
+    // §2 class 3: a 5xx IS transport-class, so it keeps the cursor and doubles the cadence.
+    expect(driver.status().intervalMs).toBe(2000);
 
     await driver.tick();
     // The re-request starts from cur-1, not the failed page's cur-2.
     expect(fake.pulls.map((p) => p.after)).toEqual([null, "cur-1", "cur-1"]);
     expect(driver.status().applied).toBe(1);
+  });
+
+  it("a permanent 400 on the FIRST row's ack does not stop the drain: the later row is still acked, and the refusal is logged once (§2 class 4)", async () => {
+    const fake = makeFakeClient({
+      // Tick 1 serves both rows on one page. Tick 2 serves only d-1 again: it was never acked, so
+      // the cloud still hands it out — which is also why no cursor was held between the ticks.
+      pull: (_after, idx) =>
+        idx === 0
+          ? page([pullRow({ decision_id: "d-1", qitem_id: "qi-1" }), pullRow({ decision_id: "d-2", qitem_id: "qi-2" })], "")
+          : idx === 1
+            ? page([pullRow({ decision_id: "d-1", qitem_id: "qi-1" })], "")
+            : OK_EMPTY,
+      // A malformed body, a stale vocabulary token, a bad bearer, an unmounted route: no cadence
+      // fixes a refused request, so one refused row must not freeze the rig behind it.
+      ack: (decisionId) =>
+        decisionId === "d-1"
+          ? { ok: false, status: 400, error: "HTTP 400: reason is not in the closed list" }
+          : { ok: true, status: 200, body: { success: true } },
+    });
+    const logs: string[] = [];
+    const driver = makeDriver(fake.client, alwaysApplied, { log: (m) => logs.push(m) });
+
+    await driver.tick();
+
+    // The drain did not stop at the refused row: d-2 was applied AND acked in the same tick, so the
+    // refusal cost one row, not the rig.
+    expect(fake.acks.map((a) => a.decisionId)).toEqual(["d-1", "d-2"]);
+    expect(driver.status().applied).toBe(2);
+    // The refused row is NOT acked: the one attempt that went out is the real one (the apply's own
+    // outcome), and no second or mutated ack was sent to force the cloud to accept it.
+    expect(fake.acks[0]).toEqual({ decisionId: "d-1", body: { machine_id: "host-42", outcome: "applied" } });
+    // A refused ack is a row-level event, not the drain's error state: the cloud still owns the row.
+    expect(driver.status().lastError).toBeNull();
+    // Class 4 is NOT transport-class: no backoff.
+    expect(driver.status().intervalMs).toBe(1000);
+
+    await driver.tick();
+    // Re-served on the NEXT drain, not suppressed: the page end was reached and the cursor deleted,
+    // so this tick asked from the first page again and the un-acked row came back.
+    expect(fake.pulls.map((p) => p.after)).toEqual([null, null]);
+    expect(fake.acks.map((a) => a.decisionId)).toEqual(["d-1", "d-2", "d-1"]);
+    expect(driver.status().applied).toBe(3);
+    // Once per episode: the cloud re-serves the un-acked row every tick, so a per-attempt line
+    // would be a drumbeat for one anomaly.
+    expect(logs.filter((m) => m.includes("d-1") && m.includes("refused"))).toHaveLength(1);
   });
 
   it("an ack that returns 409 counts as settled and advances the cursor", async () => {
@@ -345,6 +392,47 @@ describe("DecisionsPullDriver — drain, ack and cursor", () => {
     expect(fake.pulls.map((p) => p.after)).toEqual([null, null]);
     expect(driver.status().applied).toBe(4);
     expect(driver.status().lastError).toBeNull();
+  });
+
+  it("forgets a reported anomaly once a completing drain no longer serves it, and reports it once more if it comes back", async () => {
+    const bad = { decision_id: "d-bad", qitem_id: "qi-bad", author_seat_key: "seat-x", room: "room-1", answers: {}, answered_at: "2026-10-12T03:00:00.000Z" };
+    const withBad: CloudCall = { ok: true, status: 200, body: { success: true, answers: [pullRow(), bad], cursor: "" } };
+    // Tick 1 the anomaly is served. Tick 2 the cloud holds nothing un-acked for this rig, so the
+    // drain COMPLETES — which is what tells the driver the logged row is gone. Tick 3 it is back.
+    const fake = makeFakeClient({ pull: (_after, idx) => (idx === 1 || idx === 3 ? OK_EMPTY : withBad) });
+    const logs: string[] = [];
+    const driver = makeDriver(fake.client, alwaysApplied, { log: (m) => logs.push(m) });
+
+    await driver.tick();
+    expect(logs.filter((m) => m.includes("d-bad"))).toHaveLength(1);
+
+    await driver.tick(); // an empty page: nothing this rig logged is live any more
+    expect(logs.filter((m) => m.includes("d-bad"))).toHaveLength(1);
+
+    await driver.tick(); // served again: a NEW episode, so it earns its own single line
+    expect(logs.filter((m) => m.includes("d-bad"))).toHaveLength(2);
+  });
+
+  it("keys a nameless row by its own identity: a row that only MOVED is not re-reported, and a different one is not swallowed", async () => {
+    // Same reason, no decision_id: distinguishable only by their own fields.
+    const nameless = (qitem: string): unknown => ({ qitem_id: qitem, author_seat_key: "seat-a", room: "room-1", answers: {}, answered_at: "2026-10-12T03:00:00.000Z" });
+    const good = pullRow({ decision_id: "d-good" });
+    const serve = (rows: unknown[]): CloudCall => ({ ok: true, status: 200, body: { success: true, answers: rows, cursor: "" } });
+    const fake = makeFakeClient({
+      pull: (_after, idx) =>
+        idx === 0 ? serve([good, nameless("qi-a")]) : idx === 1 ? serve([nameless("qi-a"), good]) : serve([good, nameless("qi-b")]),
+    });
+    const logs: string[] = [];
+    const driver = makeDriver(fake.client, alwaysApplied, { log: (m) => logs.push(m) });
+
+    await driver.tick();
+    expect(logs.filter((m) => m.includes("unreadable"))).toHaveLength(1);
+
+    await driver.tick(); // qi-a moved from index 1 to index 0: the same anomaly, not a new one
+    expect(logs.filter((m) => m.includes("unreadable"))).toHaveLength(1);
+
+    await driver.tick(); // a DIFFERENT nameless row at the position qi-a first occupied
+    expect(logs.filter((m) => m.includes("unreadable"))).toHaveLength(2);
   });
 
   it("an HTTP 400 on the cursor clears it so the next tick sends an empty after", async () => {
