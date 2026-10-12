@@ -99,7 +99,13 @@ export async function applyPulledAnswer(deps: AnswerApplyDeps, item: PulledAnswe
   if (last === null) return { settled: true, outcome: "dropped", reason: "unknown-qitem", complete: false };
 
   if (!last.complete) {
-    log(`answer recorded qitem=${item.qitem_id} — waiting for the rest of the set`);
+    // A row that reached the pull is complete for the CLOUD's own question set (the cloud gates
+    // pending -> answered on Complete), so a set that looks partial locally means the local ask was
+    // rewritten after mirroring. The ack is therefore `applied` — holding it unsettled would
+    // re-deliver every tick forever — and the log says exactly that instead of promising a wait.
+    log(
+      `answer recorded qitem=${item.qitem_id} — recorded ${Object.keys(last.answers).length} of ${last.questions.length} local questions; the cloud row is complete and resolving; the local ask stays open for the remainder`,
+    );
     return { settled: true, outcome: "applied", complete: false };
   }
 

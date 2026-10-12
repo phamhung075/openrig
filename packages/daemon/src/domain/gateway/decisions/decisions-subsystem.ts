@@ -213,15 +213,19 @@ export function buildDecisionsHalf(opts: DecisionsHalfOpts): DecisionsHalf {
     log,
   });
 
-  /** One refusal note per distinct cause, on the row the operator is looking at. */
-  const noteRefusal = (qitemId: string, cause: string): void => {
+  /** One refusal note per distinct cause, on the row the operator is looking at. Reports whether
+   *  this call WROTE the note, which is what makes the matching log line a once-per-cause event
+   *  instead of a per-attempt drumbeat. */
+  const noteRefusal = (qitemId: string, cause: string): boolean => {
     const note = `agenthub-ask-refused ${cause}`;
     try {
       const existing = opts.queueRepo.transitionLog.listForQitem(qitemId).map((t) => t.transitionNote ?? "");
-      if (existing.includes(note)) return;
+      if (existing.includes(note)) return false;
       opts.queueRepo.update({ qitemId, actorSession: "daemon@kernel", transitionNote: note });
+      return true;
     } catch (e) {
       log(`could not note the ask refusal on ${qitemId}: ${(e as Error).message}`);
+      return false;
     }
   };
 
@@ -235,10 +239,18 @@ export function buildDecisionsHalf(opts: DecisionsHalfOpts): DecisionsHalf {
         askDriver.markReached(parsed.body.qitem_id);
         return { ok: true as const };
       }
-      const klass = isPermanentRefusal(res) ? "ask-refused" : "ask-transport";
-      if (isPermanentRefusal(res)) noteRefusal(parsed.body.qitem_id, res.error);
-      log(`ask for ${parsed.body.qitem_id} not delivered (${res.error}) — retained in the dispatch buffer; the row carries the refusal${isPermanentRefusal(res) ? "" : " (transient, replay will retry)"}`);
-      return { ok: false as const, class: klass, detail: res.error };
+      if (isPermanentRefusal(res)) {
+        // §8: a 4xx is the cloud refusing THIS attempt, so it is reported once — named by the slug
+        // the cloud answered with — and never put on a backoff ladder: the buffer's only redrive is
+        // a restart replay, and the sweep re-sends the unchanged ask on its own next tick, which is
+        // free because the ingest key is episode-stable.
+        if (noteRefusal(parsed.body.qitem_id, res.error)) {
+          log(`ask for ${parsed.body.qitem_id} refused (${res.error}) — this attempt only; the next sweep re-sends the unchanged ask`);
+        }
+        return { ok: false as const, class: "ask-refused", detail: res.error };
+      }
+      log(`ask for ${parsed.body.qitem_id} not delivered (${res.error}) — retained in the dispatch buffer, replay will retry`);
+      return { ok: false as const, class: "ask-transport", detail: res.error };
     }
     if (decision.op === STATE_OP) {
       const parsed = readStateBody(decision.payload);

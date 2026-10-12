@@ -44,33 +44,81 @@ export function ackAlreadySettled(res: CloudCall): boolean {
   return !res.ok && res.status === 409;
 }
 
-/** §1 route 2's page. A body that is not the frozen shape is an honest failure, never a guess:
- *  the driver then leaves the cursor alone and tries again on the next tick. An answer set that is
- *  EMPTY is a failure too — a `state='answered'` row by construction carries at least one pick,
- *  and skipping past it would be the silent loss at-least-once forbids. */
-export function parseAnswersPage(body: unknown): { ok: true; page: AnswersPage } | { ok: false; error: string } {
+/** A row the reader cannot use, on a page whose ENVELOPE is intact. The driver logs it once, skips
+ *  it and never acks it: the cloud's row is the cloud's to judge, and a row-level defect must not
+ *  stop the drain (§2's no-stall clause — a guard that can livelock the stream is worse than the
+ *  anomaly it guards). */
+export interface UnreadableAnswerRow {
+  index: number;
+  /** The row's own id when it carries one, so the log can name the decision; null when it does not. */
+  decisionId: string | null;
+  reason: string;
+}
+
+export type AnswersPageParse =
+  | { ok: true; page: AnswersPage; unreadable: UnreadableAnswerRow[] }
+  | { ok: false; error: string };
+
+/** §1 route 2's page, two levels of defect and only one has a cursor:
+ *
+ *   - a ROW the reader cannot use (an empty or unparseable answer set, a missing field, a
+ *     non-object row) is reported as unreadable and the PAGE stays valid, so the driver can log it
+ *     once, skip it without acking, and use the page's own cursor;
+ *   - a broken ENVELOPE (`success` not true, `answers` not an array, `cursor` not a string) has no
+ *     position to advance to, so the whole page is refused, the cursor stays put and the next tick
+ *     re-requests it — bounded by the cadence, recorded in `lastError`, self-healing for a
+ *     truncated body. */
+export function parseAnswersPage(body: unknown): AnswersPageParse {
   if (typeof body !== "object" || body === null) return { ok: false, error: "answers body is not an object" };
   const obj = body as Record<string, unknown>;
   if (obj.success !== true) return { ok: false, error: 'answers body has no "success": true' };
   const rows = obj.answers;
   if (!Array.isArray(rows)) return { ok: false, error: 'answers body has no "answers" array' };
   const out: PulledAnswer[] = [];
+  const unreadable: UnreadableAnswerRow[] = [];
+  const idOf = (row: Record<string, unknown>): string | null =>
+    typeof row.decision_id === "string" && row.decision_id.length > 0 ? row.decision_id : null;
+  const skip = (index: number, row: Record<string, unknown> | null, reason: string): void => {
+    unreadable.push({ index, decisionId: row === null ? null : idOf(row), reason });
+  };
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
-    if (typeof r !== "object" || r === null) return { ok: false, error: `answers[${i}] is not an object` };
+    if (typeof r !== "object" || r === null) {
+      skip(i, null, "row is not an object");
+      continue;
+    }
     const row = r as Record<string, unknown>;
+    let missing: string | null = null;
     for (const key of ["decision_id", "qitem_id", "author_seat_key", "room", "answered_at"] as const) {
       const v = row[key];
-      if (typeof v !== "string" || v.length === 0) return { ok: false, error: `answers[${i}].${key} must be a non-empty string` };
+      if (typeof v !== "string" || v.length === 0) { missing = key; break; }
+    }
+    if (missing !== null) {
+      skip(i, row, `${missing} must be a non-empty string`);
+      continue;
     }
     const raw = row.answers;
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { ok: false, error: `answers[${i}].answers must be an object` };
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      skip(i, row, "answers must be an object");
+      continue;
+    }
     const picks: Record<string, string> = {};
+    let badPick: string | null = null;
     for (const [questionId, optionId] of Object.entries(raw as Record<string, unknown>)) {
-      if (typeof optionId !== "string" || optionId.length === 0) return { ok: false, error: `answers[${i}].answers["${questionId}"] must be a non-empty option id` };
+      if (typeof optionId !== "string" || optionId.length === 0) {
+        badPick = `answers["${questionId}"] must be a non-empty option id`;
+        break;
+      }
       picks[questionId] = optionId;
     }
-    if (Object.keys(picks).length === 0) return { ok: false, error: `answers[${i}] carries no answers (a row in state 'answered' must carry at least one)` };
+    if (badPick !== null) {
+      skip(i, row, badPick);
+      continue;
+    }
+    if (Object.keys(picks).length === 0) {
+      skip(i, row, "carries no answers (a row in state 'answered' must carry at least one)");
+      continue;
+    }
     out.push({
       decision_id: row.decision_id as string,
       qitem_id: row.qitem_id as string,
@@ -82,7 +130,7 @@ export function parseAnswersPage(body: unknown): { ok: true; page: AnswersPage }
   }
   const cursor = obj.cursor;
   if (typeof cursor !== "string") return { ok: false, error: 'answers body\'s "cursor" must be a string (empty on the last page)' };
-  return { ok: true, page: { answers: out, cursor } };
+  return { ok: true, page: { answers: out, cursor }, unreadable };
 }
 
 export function makeCloudClient(opts: CloudClientOpts): CloudClient {

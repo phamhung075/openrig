@@ -72,7 +72,7 @@ function makeFakeClient(script: {
 function makeDriver(
   client: CloudClient,
   apply: (item: PulledAnswer) => Promise<ApplyResult>,
-  opts: { hostId?: string; intervalMs?: number; maxIntervalMs?: number } = {},
+  opts: { hostId?: string; intervalMs?: number; maxIntervalMs?: number; log?: (m: string) => void } = {},
 ): DecisionsPullDriver {
   return new DecisionsPullDriver({
     client,
@@ -82,6 +82,7 @@ function makeDriver(
     intervalMs: opts.intervalMs ?? 1000,
     maxIntervalMs: opts.maxIntervalMs ?? 1000,
     now: () => new Date("2026-10-12T00:00:00.000Z"),
+    ...(opts.log ? { log: opts.log } : {}),
   });
 }
 
@@ -130,6 +131,7 @@ describe("parseAnswersPage — frozen page shape", () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.page.cursor).toBe("cur-1");
+    expect(r.unreadable).toEqual([]);
     expect(r.page.answers).toEqual([
       { decision_id: "d-1", qitem_id: "qi-1", author_seat_key: "seat-a", room: "room-1", answers: { q1: "opt-1", q2: "opt-2" }, answered_at: "2026-10-12T01:00:00.000Z" },
       { decision_id: "d-2", qitem_id: "qi-2", author_seat_key: "seat-b", room: "room-2", answers: { q9: "opt-9" }, answered_at: "2026-10-12T02:00:00.000Z" },
@@ -148,22 +150,47 @@ describe("parseAnswersPage — frozen page shape", () => {
     if (!r.ok) expect(r.error).toMatch(/answers/i);
   });
 
-  it("refuses a row missing a required string field", () => {
-    const r = parseAnswersPage({ success: true, answers: [{ decision_id: "d-1", qitem_id: "qi-1", author_seat_key: "seat-a", answers: { q1: "opt-1" }, answered_at: "t" }], cursor: "" });
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/room/);
+  // §2 no-stall clause: a defect INSIDE a structurally valid page is a ROW problem, never a page
+  // problem. The reader could not use the row, so it is reported as unreadable while the page's
+  // own cursor stays valid — which is what makes skipping forward safe.
+  it("reports a row missing a required string field as UNREADABLE and keeps the page", () => {
+    const r = parseAnswersPage({ success: true, answers: [{ decision_id: "d-1", qitem_id: "qi-1", author_seat_key: "seat-a", answers: { q1: "opt-1" }, answered_at: "t" }], cursor: "cur-1" });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.page.answers).toEqual([]);
+    expect(r.page.cursor).toBe("cur-1");
+    expect(r.unreadable).toHaveLength(1);
+    expect(r.unreadable[0].index).toBe(0);
+    expect(r.unreadable[0].decisionId).toBe("d-1");
+    expect(r.unreadable[0].reason).toMatch(/room/);
   });
 
-  it("refuses a row whose answers is an empty object (an answered row must carry at least one pick)", () => {
+  it("reports a row whose answers is an empty object as UNREADABLE (an answered row must carry at least one pick)", () => {
     const r = parseAnswersPage({ success: true, answers: [{ ...pullRow(), answers: {} }], cursor: "" });
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/at least one/);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.page.answers).toEqual([]);
+    expect(r.unreadable[0]).toMatchObject({ index: 0, decisionId: "d-1" });
+    expect(r.unreadable[0].reason).toMatch(/at least one/);
   });
 
-  it("refuses a non-string option id", () => {
+  it("reports a non-string option id as UNREADABLE", () => {
     const r = parseAnswersPage({ success: true, answers: [{ ...pullRow(), answers: { q1: 5 } }], cursor: "" });
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/option id/);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.unreadable[0].reason).toMatch(/option id/);
+  });
+
+  it("keeps the good rows of a page one of whose rows is unreadable", () => {
+    const r = parseAnswersPage({
+      success: true,
+      answers: [pullRow({ decision_id: "d-good" }), { ...pullRow({ decision_id: "d-bad" }), answers: {} }],
+      cursor: "",
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.page.answers.map((a) => a.decision_id)).toEqual(["d-good"]);
+    expect(r.unreadable.map((u) => u.decisionId)).toEqual(["d-bad"]);
   });
 
   it("refuses a non-string cursor", () => {
@@ -267,7 +294,7 @@ describe("DecisionsPullDriver — drain, ack and cursor", () => {
     expect(driver.status().lastError).toBeNull();
   });
 
-  it("a page the parser must refuse stops the drain without advancing", async () => {
+  it("a page whose ENVELOPE is broken stops the drain without advancing (only an envelope has no position to advance to)", async () => {
     const fake = makeFakeClient({ pull: () => ({ ok: true, status: 200, body: { success: true, answers: "nope", cursor: "" } }) });
     const driver = makeDriver(fake.client, alwaysApplied);
 
@@ -280,6 +307,44 @@ describe("DecisionsPullDriver — drain, ack and cursor", () => {
     await driver.tick();
     // Nothing was skipped past: the next tick asks for the same first page.
     expect(fake.pulls.map((p) => p.after)).toEqual([null, null]);
+  });
+
+  it("a page holding one unreadable row BETWEEN two good rows applies and acks both, logs the bad row once, and never acks it", async () => {
+    const bad = {
+      decision_id: "d-bad",
+      qitem_id: "qi-bad",
+      author_seat_key: "seat-x",
+      room: "room-1",
+      answers: {},
+      answered_at: "2026-10-12T03:00:00.000Z",
+    };
+    const scripted: CloudCall = {
+      ok: true,
+      status: 200,
+      body: {
+        success: true,
+        answers: [pullRow({ decision_id: "d-1", qitem_id: "qi-1" }), bad, pullRow({ decision_id: "d-2", qitem_id: "qi-2" })],
+        cursor: "",
+      },
+    };
+    // The same page every call: the un-acked row comes back next tick, exactly as the cloud serves it.
+    const fake = makeFakeClient({ pull: () => scripted });
+    const logs: string[] = [];
+    const driver = makeDriver(fake.client, alwaysApplied, { log: (m) => logs.push(m) });
+
+    await driver.tick();
+    await driver.tick();
+
+    // Both good rows are applied and acked on both ticks: the unreadable row blocks nothing.
+    expect(fake.acks.map((a) => a.decisionId)).toEqual(["d-1", "d-2", "d-1", "d-2"]);
+    // It is never acked — the cloud's row is the cloud's to judge — and it is logged ONCE, not per tick.
+    expect(fake.acks.some((a) => a.decisionId === "d-bad")).toBe(false);
+    expect(logs.filter((m) => m.includes("d-bad"))).toHaveLength(1);
+    expect(logs.find((m) => m.includes("d-bad"))).toMatch(/not acked/i);
+    // The drain ran to the empty cursor, and a row-level defect is not a driver error.
+    expect(fake.pulls.map((p) => p.after)).toEqual([null, null]);
+    expect(driver.status().applied).toBe(4);
+    expect(driver.status().lastError).toBeNull();
   });
 
   it("an HTTP 400 on the cursor clears it so the next tick sends an empty after", async () => {

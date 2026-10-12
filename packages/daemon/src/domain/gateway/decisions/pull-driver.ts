@@ -13,9 +13,11 @@
 // back on the next tick. Nothing is remembered between ticks about what was pulled: a restart
 // re-pulls from the first page, and every step of the apply is idempotent.
 //
-// A page shape the parser rejects stops the drain WITHOUT advancing. Skipping past an unparsed row
-// would be exactly the silent loss at-least-once forbids, so a malformed page is a loud, repeated
-// error the operator can see instead.
+// Two levels of page defect, and only one of them has a cursor (§2's no-stall clause). A ROW the
+// reader cannot use (an empty or unparseable answer set, a missing field) is logged once, skipped
+// WITHOUT being acked, and the drain continues to the page's own cursor — the cloud still counts
+// that row un-acked, so it stays the cloud's to judge. A broken ENVELOPE has no position to advance
+// to, so the drain stops with the cursor unmoved and retries next tick.
 
 import { ackAlreadySettled, parseAnswersPage, type CloudCall, type CloudClient } from "./cloud-client.js";
 import type { DropReason, PulledAnswer } from "./contract.js";
@@ -68,6 +70,10 @@ export class DecisionsPullDriver {
   private readonly setTimeoutFn: (fn: () => void, ms: number) => unknown;
   private readonly clearTimeoutFn: (handle: unknown) => void;
   private readonly cursors = new Map<string, string>();
+  /** Unreadable rows already reported, keyed by rig + id/position + reason: §2 requires the log
+   *  ONCE, and the cloud re-serves an un-acked row on every tick, so a repeating message would be
+   *  a per-cadence drumbeat for one anomaly. */
+  private readonly unreadableLogged = new Set<string>();
   private interval: number;
   private timer: unknown;
   private ticking = false;
@@ -168,8 +174,18 @@ export class DecisionsPullDriver {
       const parsed = parseAnswersPage(res.body);
       if (!parsed.ok) {
         this.lastError = parsed.error;
-        log(`decisions pull rig=${rig} page refused: ${parsed.error} — cursor left unmoved (an unparsed row is never skipped past)`);
+        log(`decisions pull rig=${rig} page refused: ${parsed.error} — cursor left unmoved (a broken envelope has no position to advance to)`);
         return { continueTicking: false, transportFailed: false };
+      }
+      // Row-level defects are skipped FORWARD, never acked: the row keeps its place in the cloud's
+      // un-acked set, so it comes back, but it can no longer hold every later answer behind it.
+      for (const row of parsed.unreadable) {
+        const key = `${rig}|${row.decisionId ?? `index:${row.index}`}|${row.reason}`;
+        if (this.unreadableLogged.has(key)) continue;
+        this.unreadableLogged.add(key);
+        log(
+          `decisions pull rig=${rig} answers[${row.index}]${row.decisionId === null ? "" : ` decision=${row.decisionId}`} unreadable (${row.reason}) — skipped and NOT acked; the cloud still owns that row`,
+        );
       }
       for (const item of parsed.page.answers) {
         const outcome = await this.deps.apply(item);

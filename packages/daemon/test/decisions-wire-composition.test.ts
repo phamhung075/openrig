@@ -24,7 +24,8 @@ import { resolveSlackHandle } from "../src/domain/gateway/human-registry.js";
 import { MissionControlActionLog } from "../src/domain/mission-control/mission-control-action-log.js";
 import { MissionControlWriteContract } from "../src/domain/mission-control/mission-control-write-contract.js";
 import { DispatchBuffer } from "../src/domain/gateway/dispatch-buffer.js";
-import { ASK_OP, DECISIONS_ASK_PATH, DECISIONS_ANSWERS_PATH, decisionIdFor } from "../src/domain/gateway/decisions/contract.js";
+import { ASK_OP, DECISIONS_ASK_PATH, DECISIONS_ANSWERS_PATH, STATE_OP, decisionIdFor, decisionsStatePath } from "../src/domain/gateway/decisions/contract.js";
+import { getSelfHostId } from "../src/domain/hosts/fanout-contract.js";
 import { toAskBody } from "../src/domain/gateway/decisions/ask-driver.js";
 import { applyPulledAnswer, replyRowIdFor } from "../src/domain/gateway/decisions/answer-apply.js";
 import type { WsLike } from "../src/domain/gateway/slack/socket-inbound.js";
@@ -93,7 +94,7 @@ describe("decisions lane on the composed gateway wire (S2)", () => {
     new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
   /** Build the ONE wire with both transports, faking only the two networks. */
-  function buildWire(opts: { slackEnabled: boolean; answers?: () => Response; askStatus?: number }) {
+  function buildWire(opts: { slackEnabled: boolean; answers?: () => Response; askStatus?: number; stateStatus?: number }) {
     if (opts.slackEnabled) {
       const secrets = join(home, "slack.env");
       writeFileSync(secrets, "SLACK_BOT_TOKEN=xoxb-EXAMPLE-fake\nSLACK_APP_TOKEN=xapp-EXAMPLE-fake\n", { mode: 0o600 });
@@ -118,6 +119,10 @@ describe("decisions lane on the composed gateway wire (S2)", () => {
         }
         cloud.push({ method: init?.method ?? "GET", url, body: init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null });
         if (url.includes(DECISIONS_ANSWERS_PATH)) return (opts.answers ?? (() => reply({ success: true, answers: [], cursor: "" })))();
+        // The state URL CONTAINS the ask path as a prefix, so it is matched first.
+        if (url.endsWith("/state")) {
+          return opts.stateStatus === undefined ? reply({ success: true }) : reply({ detail: "state-resolved" }, opts.stateStatus);
+        }
         if (url.includes(DECISIONS_ASK_PATH)) {
           return opts.askStatus === undefined
             ? reply({ success: true, created: true, decision: { id: "dec-1" } })
@@ -251,5 +256,43 @@ describe("decisions lane on the composed gateway wire (S2)", () => {
     expect(second.settled).toBe(true);
     expect(repo.list({ limit: 100 }).filter((q) => q.qitemId === replyRowIdFor(qitemId))).toHaveLength(1);
     expect(repo.transitionLog.listForQitem(qitemId).filter((t) => t.ownerNotificationKind === "human-decision-resolved")).toHaveLength(1);
+  });
+
+  it("pins the state route's request shape for the hook that will produce it (this slice has none)", async () => {
+    const wire = buildWire({ slackEnabled: false });
+    const decisionId = decisionIdFor("qitem-state-fixture");
+
+    // §6.7: nothing in the daemon dispatches this op yet — the hook that observes a Slack-first
+    // answer (or a withdrawn local row) is a later slice, and neither transition out of `answered`
+    // is exercised end to end here. This case is the TARGET that hook lands on.
+    expect(wire.dispatcher.dispatch(STATE_OP, decisionId, { state: "superseded", reason: "slack-first" }, { decisionId }).ok).toBe(true);
+    await vi.waitFor(() => expect(cloud.filter((c) => c.url.endsWith("/state"))).toHaveLength(1));
+
+    const call = cloud.find((c) => c.url.endsWith("/state"))!;
+    expect(call.method).toBe("POST");
+    expect(call.url).toContain(decisionsStatePath(decisionId));
+    expect(call.body).toMatchObject({ state: "superseded", reason: "slack-first" });
+    // §4: `machine_id` carries the daemon's hostId (empty only on a host that has none, as here).
+    expect(call.body.machine_id).toBe(getSelfHostId() ?? "");
+    // Delivered, so the ack-gated drain took the push out of the durable buffer.
+    await vi.waitFor(() => expect(new DispatchBuffer(home).pending().some((d) => d.decisionId === decisionId)).toBe(false));
+
+    // The payload is validated on the way out: a state the route cannot carry is refused before
+    // any byte leaves, and the wire RETAINS it (a delivery failure is never silently dropped).
+    const badId = `${decisionId}#bad`;
+    expect(wire.dispatcher.dispatch(STATE_OP, badId, { state: "pending" }, { decisionId: badId }).ok).toBe(true);
+    await vi.waitFor(() => expect(new DispatchBuffer(home).pending().some((d) => d.decisionId === badId)).toBe(true));
+    expect(cloud.filter((c) => c.url.endsWith("/state"))).toHaveLength(1);
+  });
+
+  it("a 409 on the state push is a settled fact for that push, not a retry", async () => {
+    const wire = buildWire({ slackEnabled: false, stateStatus: 409 });
+    const decisionId = decisionIdFor("qitem-state-conflict");
+
+    expect(wire.dispatcher.dispatch(STATE_OP, decisionId, { state: "resolved" }, { decisionId }).ok).toBe(true);
+    await vi.waitFor(() => expect(cloud.filter((c) => c.url.endsWith("/state"))).toHaveLength(1));
+    // §1 route 4: the illegal transition means the cloud already holds a terminal state for the
+    // row — treated as delivered, so the push leaves the buffer instead of replaying forever.
+    await vi.waitFor(() => expect(new DispatchBuffer(home).pending()).toHaveLength(0));
   });
 });
