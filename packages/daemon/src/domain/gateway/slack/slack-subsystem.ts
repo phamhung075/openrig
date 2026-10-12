@@ -18,6 +18,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { buildInProcessWire, type GatewayWire, type SubsystemDeliverFn } from "../gateway-subsystem.js";
+import { buildDecisionsHalf } from "../decisions/decisions-subsystem.js";
 import { DispatchBuffer } from "../dispatch-buffer.js";
 import { downloadPrivateFile, isSlackHost, postChatMessage } from "./slack-api.js";
 import { loadConfig } from "./config.js";
@@ -68,6 +69,13 @@ export interface SlackWireOpts {
   inboundMaxConnects?: number;
   registry?: RegistrySurface;
   resolveHumanReply?: (input: { qitemId: string; actorSession: string; decision: string }) => Promise<"resolved" | "already-resolved" | "not-applicable">;
+  /** S2 — the cloud decisions lane composes onto this same wire. `rigNames` is the daemon's rig
+   *  list (the machine routes are rig-scoped); the rest are cadence and credential seams for
+   *  tests. The credential itself always comes from AGENTHUB_TOKEN/AGENTHUB_URL (addendum §4). */
+  rigNames?: () => string[];
+  agenthubEnvFile?: string;
+  agenthubAskIntervalMs?: number;
+  agenthubPullIntervalMs?: number;
 }
 
 interface HumanReplyActionPort {
@@ -216,22 +224,71 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   const outboundReady = cfg.enabled && bot !== null && cfg.channel !== null;
   const inboundReady = cfg.enabled && app !== null;
 
+  const registrySurface: RegistrySurface = opts.registry ?? { loadHumanRegistry, resolveSlackHandle };
+  const ports = makeQueuePorts(opts.queueRepo, {
+    loadHumanRegistry: () => registrySurface.loadHumanRegistry(opts.home),
+  });
+
+  // S2 (addendum §4) — the SECOND transport on this ONE wire: the cloud decisions lane. It shares
+  // the dispatcher and the durable buffer (a second wire would share the buffer FILE and race it),
+  // and the ops union plus the op-routed deliver keep the two transports apart by op. It composes
+  // BEFORE Slack's readiness branch on purpose: a daemon with Slack off and a cloud credential
+  // resolves its lane here, and the inert Slack wire still advertises the decisions ops.
+  const rigNames = opts.rigNames ?? (() => {
+    try {
+      const rows = opts.queueRepo.db
+        .prepare("SELECT name FROM rigs WHERE archived_at IS NULL ORDER BY created_at")
+        .all() as Array<{ name: string }>;
+      return rows.map((r) => r.name);
+    } catch (e) {
+      log(`agenthub decisions: the rig list is unreadable (${(e as Error).message}) — the pull has nothing to scope to, and says so here rather than pulling nothing silently`);
+      return [];
+    }
+  });
+  const decisions = buildDecisionsHalf({
+    home: opts.home,
+    queueRepo: opts.queueRepo,
+    ports,
+    ...(opts.resolveHumanReply ? { resolveHumanReply: opts.resolveHumanReply } : {}),
+    rigs: rigNames,
+    minimumLevel: cfg.minimumLevelThatPosts,
+    ...(opts.agenthubEnvFile === undefined ? {} : { envFile: opts.agenthubEnvFile }),
+    ...(opts.agenthubAskIntervalMs === undefined ? {} : { askIntervalMs: opts.agenthubAskIntervalMs }),
+    ...(opts.agenthubPullIntervalMs === undefined ? {} : { pullIntervalMs: opts.agenthubPullIntervalMs }),
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    log,
+  });
+
   if (!outboundReady && !inboundReady) {
     const missing = !cfg.enabled ? "connector disabled (rig slack enable)" : !bot ? "SLACK_BOT_TOKEN unresolved" : "channel unconfigured";
     log(`slack delivery not configured (${missing}) — wire is inert; dispatches would be refused honestly`);
     const inert = buildInProcessWire({
       home: opts.home,
-      ops: [],
-      deliver: async () => ({ ok: false, class: "slack-not-configured", detail: missing }),
+      ops: decisions.ops,
+      deliver: (decision) =>
+        decisions.ownsOp(decision.op)
+          ? decisions.deliver(decision)
+          : Promise.resolve({ ok: false as const, class: "slack-not-configured", detail: missing }),
       log,
     });
-    return { ...inert, status: () => ({ platform: "slack", configurationDigest: channelStateDigest(cfg), outboundReady: false, inboundReady: false, recovery: { state: "unavailable", reason: "inbound-not-configured" }, inbound: { state: "not-configured" } }) };
+    decisions.bindDispatch((op, ref, payload, dispatchOpts) => inert.dispatcher.dispatch(op, ref, payload, dispatchOpts));
+    return {
+      dispatcher: inert.dispatcher,
+      startServices: () => {
+        inert.startServices?.();
+        decisions.start();
+      },
+      stop: () => {
+        decisions.stop();
+        inert.stop();
+      },
+      status: () => ({
+        platform: "slack", configurationDigest: channelStateDigest(cfg), outboundReady: false, inboundReady: false,
+        recovery: { state: "unavailable", reason: "inbound-not-configured" }, inbound: { state: "not-configured" },
+        agenthub: decisions.status(),
+      }),
+    };
   }
-
-  const registrySurface: RegistrySurface = opts.registry ?? { loadHumanRegistry, resolveSlackHandle };
-  const ports = makeQueuePorts(opts.queueRepo, {
-    loadHumanRegistry: () => registrySurface.loadHumanRegistry(opts.home),
-  });
   // OPR.0.5.6.1 — the one engine consult (AM-F5: the gateway consults the
   // engine BEFORE dispatch). Null = destination is not a registered human;
   // the caller keeps the pre-engine dial behavior (stated degrade).
@@ -646,18 +703,33 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     return deliver(decision);
   };
 
+  // The decisions lane and its ports were composed above (before the inert branch); here the ONE
+  // wire takes both transports' ops, and the op-routed deliver picks between them.
+  const deliverByOp: SubsystemDeliverFn = (decision) => {
+    if (decisions.ownsOp(decision.op)) return decisions.deliver(decision);
+    return outboundReady ? engineDeliver(decision) : deliver(decision);
+  };
+
   const wire = buildInProcessWire({
     home: opts.home,
-    ops: outboundReady ? [OUTBOUND_OP] : [],
-    deliver: outboundReady ? engineDeliver : deliver,
+    ops: [...(outboundReady ? [OUTBOUND_OP] : []), ...decisions.ops],
+    deliver: deliverByOp,
     log,
   });
+  decisions.bindDispatch((op, ref, payload, dispatchOpts) => wire.dispatcher.dispatch(op, ref, payload, dispatchOpts));
 
   // Services are CONSTRUCTED here but started only via startServices() (post-bind, index.ts):
   // composing a daemon must never dial Slack or start pollers — the createDaemon-in-tests
   // hermeticity rule, same as every monitor in the supervision tree.
   const stops: Array<() => void> = [];
   const starts: Array<() => void> = [];
+  // S2 — the decisions lane's drivers are network services too: they start post-bind beside the
+  // Slack ones, never at composition, so a test-built daemon never dials the cloud.
+  starts.push(() => {
+    decisions.start();
+    log("agenthub decisions drivers started (subsystem path)");
+  });
+  stops.push(() => decisions.stop());
   let inboundHandle: SocketInboundHandle | undefined;
   let recovery: ChannelRecovery | undefined;
 
@@ -776,6 +848,9 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       // an unreadable file reports state "unknown" with a reason instead of a
       // false zero.
       ...deadLetterBacklogFields(dead, deadActions),
+      // S2 — the cloud decisions lane rides this same wire; its readiness, credential state and
+      // driver counters report here, never as a second platform.
+      agenthub: decisions.status(),
     }),
   };
 }

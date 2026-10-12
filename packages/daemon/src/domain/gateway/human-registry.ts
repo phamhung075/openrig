@@ -24,7 +24,7 @@ import { parseSessionName } from "../session-name.js";
 
 // ── Schema (closed enums; extend only additively behind the contract) ──
 export const HUMAN_ENTITY_CLASSES = new Set(["human"]);          // M1's only class
-export const HUMAN_CONNECTOR_KINDS = new Set(["slack"]);          // M1's only kind
+export const HUMAN_CONNECTOR_KINDS = new Set(["slack", "agenthub"]); // S2: agenthub is the cloud decisions lane (ARCH-ADDENDUM-s2-wire-freeze §4)
 export const HUMAN_BINDING_ROLES = new Set(["primary", "secondary"]);
 export const HUMAN_DELIVERY_CLASSES = new Set(["A", "B", "C", "D"]);
 // entityId is the fragment key + filename: a stable slug that survives platform
@@ -54,7 +54,10 @@ function unknownKey(obj: Record<string, unknown>, allowed: Set<string>): string 
 }
 
 export interface HumanConnectorBinding {
-  kind: "slack";
+  /** The connector this binding reaches. Kept as an inline literal of the closed set (no separate
+   *  union type); HUMAN_CONNECTOR_KINDS below is the runtime authority and the loader refuses
+   *  anything outside it. S2 added "agenthub" (the cloud decisions lane) — extend both together. */
+  kind: "slack" | "agenthub";
   connectorRef: string;
   /** POINTER at the connector's vault (secrets-on-connector) — NEVER the secret. */
   secretsRef: string;

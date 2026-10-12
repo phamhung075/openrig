@@ -1,0 +1,360 @@
+import { describe, it, expect } from "vitest";
+import {
+  decisionIdFor,
+  dropReasonFor,
+  type AckBody,
+  type PulledAnswer,
+} from "../src/domain/gateway/decisions/contract.js";
+import {
+  ackAlreadySettled,
+  parseAnswersPage,
+  type CloudCall,
+  type CloudClient,
+} from "../src/domain/gateway/decisions/cloud-client.js";
+import {
+  DecisionsPullDriver,
+  DEFAULT_PULL_INTERVAL_MS,
+  MAX_PULL_INTERVAL_MS,
+} from "../src/domain/gateway/decisions/pull-driver.js";
+import type { ApplyResult } from "../src/domain/gateway/decisions/answer-apply.js";
+
+// S2 — the cloud decisions wire, PULL half. Real behaviour only: the page parser's accept/refuse
+// boundary, the map onto the cloud's closed drop vocabulary, and the driver's cursor/ack/backoff
+// transitions under a scripted fake client.
+
+const OK_EMPTY: CloudCall = { ok: true, status: 200, body: { success: true, answers: [], cursor: "" } };
+
+function pullRow(over: Partial<PulledAnswer> = {}): PulledAnswer {
+  return {
+    decision_id: "d-1",
+    qitem_id: "qi-1",
+    author_seat_key: "seat-a",
+    room: "room-1",
+    answers: { q1: "opt-1" },
+    answered_at: "2026-10-12T00:00:00.000Z",
+    ...over,
+  };
+}
+
+function page(answers: PulledAnswer[], cursor: string): CloudCall {
+  return { ok: true, status: 200, body: { success: true, answers, cursor } };
+}
+
+interface FakeClient {
+  client: CloudClient;
+  pulls: { rig: string; after: string | null }[];
+  acks: { decisionId: string; body: AckBody }[];
+}
+
+function makeFakeClient(script: {
+  pull: (after: string | null, callIndex: number) => CloudCall;
+  ack?: (decisionId: string, body: AckBody, callIndex: number) => CloudCall;
+}): FakeClient {
+  const pulls: { rig: string; after: string | null }[] = [];
+  const acks: { decisionId: string; body: AckBody }[] = [];
+  const client: CloudClient = {
+    postAsk: async () => ({ ok: true, status: 200, body: {} }),
+    pullAnswers: async (rig, after) => {
+      const idx = pulls.length;
+      pulls.push({ rig, after });
+      return script.pull(after, idx);
+    },
+    ack: async (decisionId, body) => {
+      const idx = acks.length;
+      acks.push({ decisionId, body });
+      return script.ack?.(decisionId, body, idx) ?? { ok: true, status: 200, body: { success: true } };
+    },
+    pushState: async () => ({ ok: true, status: 200, body: {} }),
+  };
+  return { client, pulls, acks };
+}
+
+function makeDriver(
+  client: CloudClient,
+  apply: (item: PulledAnswer) => Promise<ApplyResult>,
+  opts: { hostId?: string; intervalMs?: number; maxIntervalMs?: number } = {},
+): DecisionsPullDriver {
+  return new DecisionsPullDriver({
+    client,
+    rigs: () => ["rig-1"],
+    apply,
+    hostId: () => opts.hostId ?? "host-42",
+    intervalMs: opts.intervalMs ?? 1000,
+    maxIntervalMs: opts.maxIntervalMs ?? 1000,
+    now: () => new Date("2026-10-12T00:00:00.000Z"),
+  });
+}
+
+const alwaysApplied = async (): Promise<ApplyResult> => ({ settled: true, outcome: "applied", complete: true });
+
+function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
+describe("decisions contract — identity and drop vocabulary", () => {
+  it("decisionIdFor is episode-stable and names the connector kind", () => {
+    const id = decisionIdFor("qitem-x");
+    expect(id).toBe("agenthub:decision:qitem-x");
+    // The same qitem id maps to the same key twice (one cloud row, never a duplicate).
+    expect(decisionIdFor("qitem-x")).toBe(id);
+    expect(decisionIdFor("qitem-y")).not.toBe(id);
+  });
+
+  it("dropReasonFor maps every local refusal onto the closed cloud vocabulary", () => {
+    expect(dropReasonFor("state-done")).toBe("state-done");
+    expect(dropReasonFor("state-weird")).toBe("state-done"); // any state-* prefix
+    expect(dropReasonFor("not-the-asked-human")).toBe("not-the-asked-human");
+    expect(dropReasonFor("resolve-not-applicable")).toBe("already-applied");
+    expect(dropReasonFor("already-applied")).toBe("already-applied");
+    expect(dropReasonFor("something-unmapped")).toBe("unknown-qitem");
+  });
+
+  it("pins the shipped cadence and its ceiling", () => {
+    expect(DEFAULT_PULL_INTERVAL_MS).toBe(30000);
+    expect(MAX_PULL_INTERVAL_MS).toBe(300000);
+  });
+});
+
+describe("parseAnswersPage — frozen page shape", () => {
+  it("parses a well-formed page into exact rows (answers as a questionId→optionId map) and cursor", () => {
+    const r = parseAnswersPage({
+      success: true,
+      answers: [
+        { decision_id: "d-1", qitem_id: "qi-1", author_seat_key: "seat-a", room: "room-1", answers: { q1: "opt-1", q2: "opt-2" }, answered_at: "2026-10-12T01:00:00.000Z" },
+        { decision_id: "d-2", qitem_id: "qi-2", author_seat_key: "seat-b", room: "room-2", answers: { q9: "opt-9" }, answered_at: "2026-10-12T02:00:00.000Z" },
+      ],
+      cursor: "cur-1",
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.page.cursor).toBe("cur-1");
+    expect(r.page.answers).toEqual([
+      { decision_id: "d-1", qitem_id: "qi-1", author_seat_key: "seat-a", room: "room-1", answers: { q1: "opt-1", q2: "opt-2" }, answered_at: "2026-10-12T01:00:00.000Z" },
+      { decision_id: "d-2", qitem_id: "qi-2", author_seat_key: "seat-b", room: "room-2", answers: { q9: "opt-9" }, answered_at: "2026-10-12T02:00:00.000Z" },
+    ]);
+  });
+
+  it("refuses a body without success:true", () => {
+    const r = parseAnswersPage({ answers: [], cursor: "" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/success/i);
+  });
+
+  it("refuses answers that is not an array", () => {
+    const r = parseAnswersPage({ success: true, answers: "nope", cursor: "" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/answers/i);
+  });
+
+  it("refuses a row missing a required string field", () => {
+    const r = parseAnswersPage({ success: true, answers: [{ decision_id: "d-1", qitem_id: "qi-1", author_seat_key: "seat-a", answers: { q1: "opt-1" }, answered_at: "t" }], cursor: "" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/room/);
+  });
+
+  it("refuses a row whose answers is an empty object (an answered row must carry at least one pick)", () => {
+    const r = parseAnswersPage({ success: true, answers: [{ ...pullRow(), answers: {} }], cursor: "" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/at least one/);
+  });
+
+  it("refuses a non-string option id", () => {
+    const r = parseAnswersPage({ success: true, answers: [{ ...pullRow(), answers: { q1: 5 } }], cursor: "" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/option id/);
+  });
+
+  it("refuses a non-string cursor", () => {
+    const r = parseAnswersPage({ success: true, answers: [], cursor: 7 });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/cursor/);
+  });
+});
+
+describe("ackAlreadySettled", () => {
+  it("treats only a 409 as settled", () => {
+    expect(ackAlreadySettled({ ok: false, status: 409, error: "HTTP 409: gone" })).toBe(true);
+    expect(ackAlreadySettled({ ok: false, status: 500, error: "HTTP 500: boom" })).toBe(false);
+    expect(ackAlreadySettled({ ok: true, status: 200, body: { success: true } })).toBe(false);
+    expect(ackAlreadySettled({ ok: false, error: "network: reset" })).toBe(false);
+  });
+});
+
+describe("DecisionsPullDriver — drain, ack and cursor", () => {
+  it("drains a single page ending with an empty cursor and acks with hostId + outcome applied", async () => {
+    const fake = makeFakeClient({
+      pull: (_after, idx) => (idx === 0 ? page([pullRow()], "") : OK_EMPTY),
+    });
+    const driver = makeDriver(fake.client, alwaysApplied, { hostId: "host-42" });
+
+    await driver.tick();
+
+    expect(fake.pulls).toEqual([{ rig: "rig-1", after: null }]);
+    expect(fake.acks).toEqual([
+      { decisionId: "d-1", body: { machine_id: "host-42", outcome: "applied" } },
+    ]);
+    expect(driver.status().applied).toBe(1);
+  });
+
+  it("drains page after page until the cursor is empty; the next request's after is the first page's cursor", async () => {
+    const fake = makeFakeClient({
+      pull: (_after, idx) => {
+        if (idx === 0) return page([pullRow({ decision_id: "d-1", qitem_id: "qi-1" })], "cur-1");
+        if (idx === 1) return page([pullRow({ decision_id: "d-2", qitem_id: "qi-2" })], "");
+        return OK_EMPTY;
+      },
+    });
+    const driver = makeDriver(fake.client, alwaysApplied);
+
+    await driver.tick();
+
+    expect(fake.pulls.map((p) => p.after)).toEqual([null, "cur-1"]);
+    expect(fake.acks.map((a) => a.decisionId)).toEqual(["d-1", "d-2"]);
+    expect(driver.status().applied).toBe(2);
+  });
+
+  it("an unsettled apply produces NO ack and leaves the cursor unmoved (same page start re-pulled)", async () => {
+    const fake = makeFakeClient({
+      pull: (_after, idx) => (idx === 0 ? page([pullRow()], "cur-1") : OK_EMPTY),
+    });
+    const apply = async (): Promise<ApplyResult> => ({ settled: false, reason: "record-failed" });
+    const driver = makeDriver(fake.client, apply);
+
+    await driver.tick();
+    expect(fake.acks).toEqual([]);
+
+    await driver.tick();
+    // The failing page's cursor was never committed: both ticks ask for the same page start.
+    expect(fake.pulls.map((p) => p.after)).toEqual([null, null]);
+  });
+
+  it("an ack that fails with 500 leaves the cursor at the pre-page value", async () => {
+    let ackCalls = 0;
+    const fake = makeFakeClient({
+      pull: (_after, idx) => {
+        if (idx === 0) return page([pullRow({ decision_id: "d-1", qitem_id: "qi-1" })], "cur-1");
+        if (idx === 1) return page([pullRow({ decision_id: "d-2", qitem_id: "qi-2" })], "cur-2");
+        return OK_EMPTY;
+      },
+      ack: () => (ackCalls++ === 0 ? { ok: true, status: 200, body: { success: true } } : { ok: false, status: 500, error: "HTTP 500: boom" }),
+    });
+    const driver = makeDriver(fake.client, alwaysApplied);
+
+    await driver.tick(); // page1 acked (cursor -> cur-1), page2 ack fails: cur-2 must not be committed
+    expect(fake.acks.map((a) => a.decisionId)).toEqual(["d-1", "d-2"]);
+
+    await driver.tick();
+    // The re-request starts from cur-1, not the failed page's cur-2.
+    expect(fake.pulls.map((p) => p.after)).toEqual([null, "cur-1", "cur-1"]);
+    expect(driver.status().applied).toBe(1);
+  });
+
+  it("an ack that returns 409 counts as settled and advances the cursor", async () => {
+    const fake = makeFakeClient({
+      pull: (_after, idx) => (idx === 0 ? page([pullRow()], "cur-1") : OK_EMPTY),
+      ack: () => ({ ok: false, status: 409, error: "HTTP 409: already acked" }),
+    });
+    const driver = makeDriver(fake.client, alwaysApplied);
+
+    await driver.tick();
+
+    expect(fake.acks.map((a) => a.decisionId)).toEqual(["d-1"]);
+    // Advanced past the row and drained: two requests, the second using the page cursor.
+    expect(fake.pulls.map((p) => p.after)).toEqual([null, "cur-1"]);
+    expect(driver.status().applied).toBe(1);
+    expect(driver.status().lastError).toBeNull();
+  });
+
+  it("a page the parser must refuse stops the drain without advancing", async () => {
+    const fake = makeFakeClient({ pull: () => ({ ok: true, status: 200, body: { success: true, answers: "nope", cursor: "" } }) });
+    const driver = makeDriver(fake.client, alwaysApplied);
+
+    await driver.tick();
+
+    expect(fake.pulls.map((p) => p.after)).toEqual([null]);
+    expect(fake.acks).toEqual([]);
+    expect(driver.status().lastError).toMatch(/answers/i);
+
+    await driver.tick();
+    // Nothing was skipped past: the next tick asks for the same first page.
+    expect(fake.pulls.map((p) => p.after)).toEqual([null, null]);
+  });
+
+  it("an HTTP 400 on the cursor clears it so the next tick sends an empty after", async () => {
+    const fake = makeFakeClient({
+      pull: (_after, idx) => {
+        if (idx === 0) return page([], "cur-1"); // commit cur-1, then the next call is refused
+        return { ok: false, status: 400, error: "HTTP 400: unknown cursor" };
+      },
+    });
+    const driver = makeDriver(fake.client, alwaysApplied);
+
+    await driver.tick();
+    await driver.tick();
+
+    // null, then cur-1 (committed, then rejected), then null again after the cursor was dropped.
+    expect(fake.pulls.map((p) => p.after)).toEqual([null, "cur-1", null]);
+  });
+
+  it("a 5xx pull doubles the interval up to the ceiling; the next success resets it to base", async () => {
+    const fake = makeFakeClient({
+      pull: (_after, idx) => (idx < 2 ? { ok: false, status: 503, error: "HTTP 503: down" } : OK_EMPTY),
+    });
+    const driver = makeDriver(fake.client, alwaysApplied, { intervalMs: 1000, maxIntervalMs: 2000 });
+
+    expect(driver.status().intervalMs).toBe(1000);
+    await driver.tick();
+    expect(driver.status().intervalMs).toBe(2000); // doubled
+    await driver.tick();
+    expect(driver.status().intervalMs).toBe(2000); // clamped at the ceiling, not 4000
+    await driver.tick();
+    expect(driver.status().intervalMs).toBe(1000); // first success resets to base
+  });
+
+  it("a second tick while one is in flight is a no-op (the client sees only the first tick's calls)", async () => {
+    const gate = deferred<ApplyResult>();
+    const fake = makeFakeClient({
+      pull: (_after, idx) => (idx === 0 ? page([pullRow()], "cur-1") : OK_EMPTY),
+    });
+    let applyCalls = 0;
+    const driver = makeDriver(fake.client, () => { applyCalls++; return gate.promise; });
+
+    const first = driver.tick();
+    const second = driver.tick(); // sees ticking === true and returns immediately
+    gate.resolve({ settled: true, outcome: "applied", complete: true });
+    await Promise.all([first, second]);
+
+    expect(applyCalls).toBe(1);
+    expect(fake.pulls.map((p) => p.after)).toEqual([null, "cur-1"]);
+    expect(driver.status().ticks).toBe(1);
+  });
+
+  it("counts dropped outcomes separately from applied ones", async () => {
+    const fake = makeFakeClient({
+      pull: () =>
+        page(
+          [
+            pullRow({ decision_id: "d-a", qitem_id: "qi-a" }),
+            pullRow({ decision_id: "d-b", qitem_id: "qi-b" }),
+          ],
+          "",
+        ),
+    });
+    const apply = async (item: PulledAnswer): Promise<ApplyResult> =>
+      item.decision_id === "d-a"
+        ? { settled: true, outcome: "applied", complete: true }
+        : { settled: true, outcome: "dropped", reason: "state-done", complete: false };
+    const driver = makeDriver(fake.client, apply);
+
+    await driver.tick();
+
+    expect(driver.status().applied).toBe(1);
+    expect(driver.status().dropped).toBe(1);
+    expect(fake.acks).toEqual([
+      { decisionId: "d-a", body: { machine_id: "host-42", outcome: "applied" } },
+      { decisionId: "d-b", body: { machine_id: "host-42", outcome: "dropped", reason: "state-done" } },
+    ]);
+  });
+});
