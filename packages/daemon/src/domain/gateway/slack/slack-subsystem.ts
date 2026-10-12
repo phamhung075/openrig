@@ -74,6 +74,12 @@ export interface SlackWireOpts {
    *  tests. The credential itself always comes from AGENTHUB_TOKEN/AGENTHUB_URL (addendum §4). */
   rigNames?: () => string[];
   agenthubEnvFile?: string;
+  /** §6.2's divergent case: the cloud room for a rig whose NAME is not its room's slug. The lane
+   *  says `room` wins when present and the cloud resolves it from `rig` otherwise, and that a
+   *  divergence is a named 404 and never a silent wrong room — so a rig that diverges must be able
+   *  to name its room, and this is the seam a caller does it through. Unset (every rig whose name IS
+   *  its room's slug) sends no `room` and the cloud resolves. */
+  room?: string | null;
   agenthubAskIntervalMs?: number;
   agenthubPullIntervalMs?: number;
 }
@@ -252,6 +258,13 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     ...(opts.resolveHumanReply ? { resolveHumanReply: opts.resolveHumanReply } : {}),
     rigs: rigNames,
     minimumLevel: cfg.minimumLevelThatPosts,
+    ...(opts.room ? { room: opts.room } : {}),
+    // ONE registry surface for the whole wire. The half defaults to the file projection; forwarding
+    // what the wire already resolved keeps a caller's registry governing the sweep's classification
+    // too (the ask driver reads it, ask-driver.ts), instead of the wire holding a registry it uses
+    // for one transport and the default for the other. The default is that same loader on the
+    // default home, so an unset option behaves exactly as before.
+    loadHumanRegistry: registrySurface.loadHumanRegistry,
     ...(opts.agenthubEnvFile === undefined ? {} : { envFile: opts.agenthubEnvFile }),
     ...(opts.agenthubAskIntervalMs === undefined ? {} : { askIntervalMs: opts.agenthubAskIntervalMs }),
     ...(opts.agenthubPullIntervalMs === undefined ? {} : { pullIntervalMs: opts.agenthubPullIntervalMs }),

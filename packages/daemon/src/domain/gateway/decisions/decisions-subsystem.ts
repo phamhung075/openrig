@@ -182,6 +182,9 @@ export function buildDecisionsHalf(opts: DecisionsHalfOpts): DecisionsHalf {
     resolveSeatKey: seatKeyBySession,
     kind: DECISIONS_CONNECTOR_KIND,
     filter: { minimumLevel: opts.minimumLevel ?? "NOTICE" },
+    // §6.2's hatch, end to end: declared on this half, and it has to reach the driver that builds
+    // the body, or `room` can never ride an ask and a divergent rig is a guaranteed 404.
+    ...(opts.room ? { room: opts.room } : {}),
     ...(opts.askIntervalMs === undefined ? {} : { intervalMs: opts.askIntervalMs }),
     log,
   });

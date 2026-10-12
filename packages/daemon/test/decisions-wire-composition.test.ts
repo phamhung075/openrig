@@ -167,6 +167,9 @@ describe("decisions lane on the composed gateway wire (S2)", () => {
     const call = cloud.find((c) => c.url.includes(DECISIONS_ASK_PATH))!;
     expect(call.method).toBe("POST");
     expect(call.body).toMatchObject({ rig: "4genthub-min", idempotency_key: decisionIdFor(qitemId), questions });
+    // This wire is built with NO room, so the body must carry no `room` key at all — the cloud then
+    // resolves the room from `rig`, which is the path every rig whose name IS its room's slug takes.
+    expect(call.body).not.toHaveProperty("room");
     // The delivery is ack-gated: the durable buffer is empty only because the cloud answered 2xx.
     await vi.waitFor(() => expect(new DispatchBuffer(home).pending()).toHaveLength(0));
     // Op routing: the SAME wire sent nothing to Slack for this op.
